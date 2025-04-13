@@ -1,0 +1,178 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import gamma, norm
+import warnings
+warnings.filterwarnings('ignore')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import pearson3
+
+
+# Load and preprocess data
+df = pd.read_csv('/content/Haveri.csv')
+melted_df = pd.melt(
+    df,
+    id_vars=['DISTRICT', 'TALUK', 'TALUKCODE', 'YEAR'],
+    var_name='DayMonth',
+    value_name='Precipitation'
+)
+melted_df[['Day', 'Month']] = melted_df['DayMonth'].str.split('-', expand=True)
+melted_df['Day'] = melted_df['Day'].astype(int)
+melted_df.dropna(subset=['Precipitation'], inplace=True)
+
+# Aggregate to monthly data
+monthly_df = melted_df.groupby(
+    ['DISTRICT', 'TALUK', 'TALUKCODE', 'YEAR', 'Month']
+)['Precipitation'].sum().reset_index()
+
+month_order = {
+    'Jan': 1, 'Feb': 2, 'Mar':3, 'Apr':4, 'May':5, 'Jun':6,
+    'Jul':7, 'Aug':8, 'Sep':9, 'Oct':10, 'Nov':11, 'Dec':12
+}
+monthly_df['MonthNumber'] = monthly_df['Month'].map(month_order)
+monthly_df.sort_values(['YEAR', 'MonthNumber'], inplace=True)
+
+# Calculate rolling sums for different time scales
+time_scales = [3, 6, 12]
+for ts in time_scales:
+    monthly_df[f'{ts}_month_sum'] = monthly_df.groupby(
+        ['DISTRICT', 'TALUK', 'TALUKCODE']
+    )['Precipitation'].transform(lambda x: x.rolling(window=ts, min_periods=ts).sum())
+
+# Calculate SPI for all time scales
+for ts in time_scales:
+    spi_col = f'SPI_{ts}'
+    monthly_df[spi_col] = np.nan
+
+    for (district, taluk, talukcode, month), group in monthly_df.groupby(['DISTRICT', 'TALUK', 'TALUKCODE', 'Month']):
+        valid_group = group.dropna(subset=[f'{ts}_month_sum'])
+        sums = valid_group[f'{ts}_month_sum'].values
+
+        if len(sums) == 0:
+            continue
+
+        q = np.sum(sums == 0) / len(sums)
+        non_zero_sums = sums[sums > 0]
+
+        if len(non_zero_sums) < 1:
+            spi_values = np.full(len(valid_group), -3.0)
+        else:
+            a, loc, scale = gamma.fit(non_zero_sums, floc=0)
+            spi_values = []
+            for x in valid_group[f'{ts}_month_sum']:
+                if x == 0:
+                    cdf = q
+                else:
+                    cdf = q + (1 - q) * gamma.cdf(x, a, loc=0, scale=scale)
+                cdf = np.clip(cdf, 0.0001, 0.9999)
+                spi = norm.ppf(cdf)
+                spi_values.append(spi)
+
+        monthly_df.loc[valid_group.index, spi_col] = spi_values
+
+
+
+
+
+# Filter data for specific Taluk
+taluk_name = 'BYADGI'
+filtered_df = monthly_df[monthly_df['TALUK'] == taluk_name].copy()
+filtered_df['Date'] = pd.to_datetime(filtered_df['YEAR'].astype(str) + '-' + filtered_df['MonthNumber'].astype(str) + '-15')
+
+
+
+
+# Plot time series for all SPIs
+plt.figure(figsize=(16, 12))
+for i, ts in enumerate(time_scales, 1):
+    plt.subplot(3, 1, i)
+    sns.lineplot(data=filtered_df, x='Date', y=f'SPI_{ts}', marker='o')
+    plt.axhline(0, color='black', linestyle='--')
+    plt.axhline(-1, color='red', linestyle='--', label='Moderate Drought')
+    plt.axhline(-1.5, color='red', linestyle='-.', label='Severe Drought')
+    plt.axhline(-2, color='red', linestyle=':', label='Extreme Drought')
+    plt.title(f'SPI-{ts} for {taluk_name} Taluk', fontsize=12)
+    plt.ylabel(f'SPI-{ts}')
+    plt.grid(True)
+    if i == 1:
+        plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+
+# Heatmaps for all SPIs
+plt.figure(figsize=(18, 6))
+for i, ts in enumerate(time_scales, 1):
+    plt.subplot(1, 3, i)
+    pivot_df = filtered_df.pivot(index='YEAR', columns='MonthNumber', values=f'SPI_{ts}')
+    sns.heatmap(pivot_df, annot=True, cmap='RdBu', center=0, fmt=".2f", cbar_kws={'label': f'SPI-{ts}'})
+    plt.title(f'SPI-{ts} Heatmap', fontsize=12)
+    plt.xlabel('Month')
+    plt.ylabel('Year')
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+# Histograms for all SPIs
+plt.figure(figsize=(15, 5))
+for i, ts in enumerate(time_scales, 1):
+    plt.subplot(1, 3, i)
+    sns.histplot(filtered_df[f'SPI_{ts}'].dropna(), bins=30, kde=True)
+    plt.title(f'SPI-{ts} Distribution', fontsize=12)
+    plt.xlabel(f'SPI-{ts} Value')
+    plt.ylabel('Frequency')
+plt.tight_layout()
+plt.show()
+
+
+
+# Add Date column to monthly_df (BEFORE melting)
+monthly_df['Date'] = pd.to_datetime(
+    monthly_df['YEAR'].astype(str) + '-' + 
+    monthly_df['MonthNumber'].astype(str) + '-15'
+)
+
+# Then prepare data for facet grid comparison
+melted_spi = monthly_df.melt(
+    id_vars=['DISTRICT', 'TALUK', 'TALUKCODE', 'YEAR', 'MonthNumber', 'Date'],
+    value_vars=[f'SPI_{ts}' for ts in time_scales],
+    var_name='SPI_scale',
+    value_name='SPI_value'
+)
+
+
+!pip install seaborn --upgrade
+
+# Comparative facet plot with legend at bottom
+g = sns.FacetGrid(melted_spi, 
+                 col="TALUK", 
+                 row="SPI_scale",
+                 hue="TALUK", 
+                 height=3, 
+                 aspect=2,
+                 row_order=[f'SPI_{ts}' for ts in time_scales], # Change row_order to match SPI_scale values
+                 sharey=False)
+
+g.map(sns.lineplot, "Date", "SPI_value")
+g.set_axis_labels("Date", "SPI Value")
+
+# Set row and column templates (for Seaborn >= 0.11.2)
+g.set_titles(col_template="{col_name}", row_template="{row_name}")  
+
+# Add legend at bottom with proper spacing
+g.add_legend(
+    title="Taluk",
+    bbox_to_anchor=(0.5, -0.5),  # Positions below the plots
+    loc='upper center',
+    ncol=3,  # Number of columns in legend
+    frameon=True
+)
+
+# Adjust layout to make space for legend
+plt.subplots_adjust(bottom=0.3)  # Increase bottom margin
+plt.tight_layout()
+plt.show()
